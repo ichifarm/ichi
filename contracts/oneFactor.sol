@@ -40,7 +40,7 @@ contract oneFactor {
                 if (number % i == 0) {
                     _factorLookup[number].push(i);
 
-                    if (i * DECIMALS != Math.sqrt(number * DECIMALS)) {
+                    if (i * DECIMALS != Math.sqrt(number * DECIMALS) && number.div(i) != i) {
                         _factorLookup[number].push(number.div(i));
                     }
                 }
