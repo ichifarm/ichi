@@ -1,0 +1,64 @@
+{
+  "name": "ichi.farm",
+  "logoURI": "ipfs://QmUSNbwUxUYNMvMksKypkgWs8unSm8dX2GjCPBVGZ7GGMr",
+  "keywords": [
+    "ichi",
+    "farm",
+    "fractional"
+  ],
+  "tags": {
+    "stablecoin": {
+      "name": "Stablecoin",
+      "description": "fractional stablecoins for each community and a governance token to rule them all"
+    }
+  },
+  "timestamp": "2020-11-19T00:00:00+00:00",
+  "tokens": [
+    {
+      "chainId": 1,
+      "address": "0x903bEF1736CDdf2A537176cf3C64579C3867A881",
+      "symbol": "ICHI",
+      "name": "ichi.farm",
+      "decimals": 9,
+      "logoURI": "ipfs://QmTcGkZyQGC3DdKxZhndHCWqvxj9QeLYBmiKs4N2k1VJUy"
+    },
+    {
+      "chainId": 1,
+      "address": "0xC88F47067dB2E25851317A2FDaE73a22c0777c37",
+      "symbol": "oneBTC",
+      "name": "oneBTC",
+      "decimals": 9,
+      "logoURI": "ipfs://QmSbj5779iam33GNErj7JgkSjVVymmbeXcJjVRRg4sgGg9",
+      "tags": [
+        "compound"
+      ]
+    },
+    {
+      "chainId": 1,
+      "address": "0x6fcBBB527Fb2954BED2B224A5BB7c23C5AeEb6E1",
+      "symbol": "oneETH",
+      "name": "oneETH",
+      "decimals": 9,
+      "logoURI": "ipfs://QmcW8NHiqb6DnhWd5yo96K78qUuYvw7482x6WTzByJ2RKt"
+    },
+    {
+      "chainId": 1,
+      "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "symbol": "WETH",
+      "name": "WETH",
+      "decimals": 18
+    },
+    {
+      "chainId": 1,
+      "address": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "symbol": "wBTC",
+      "name": "wBTC",
+      "decimals": 8
+    }
+  ],
+  "version": {
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  }
+}
