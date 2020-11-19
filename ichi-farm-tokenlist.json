@@ -1,6 +1,6 @@
 {
   "name": "IchiFarm",
-  "logoURI": "ipfs://0x903bEF1736CDdf2A537176cf3C64579C3867A881",
+  "logoURI": "https://raw.githubusercontent.com/ichifarm/ichi/main/assets/ichi_square.svg",
   "keywords": [
     "ichi",
     "farm",
@@ -20,7 +20,7 @@
       "symbol": "ICHI",
       "name": "ichi.farm",
       "decimals": 9,
-      "logoURI": "ipfs://QmTcGkZyQGC3DdKxZhndHCWqvxj9QeLYBmiKs4N2k1VJUy"
+      "logoURI": "https://raw.githubusercontent.com/ichifarm/ichi/main/assets/ichi_square.svg"
     },
     {
       "chainId": 1,
@@ -28,7 +28,7 @@
       "symbol": "oneBTC",
       "name": "oneBTC",
       "decimals": 9,
-      "logoURI": "ipfs://QmSbj5779iam33GNErj7JgkSjVVymmbeXcJjVRRg4sgGg9",
+      "logoURI": "https://raw.githubusercontent.com/ichifarm/ichi/main/assets/oneBTC.svg",
       "tags": [
         "compound"
       ]
@@ -39,7 +39,7 @@
       "symbol": "oneETH",
       "name": "oneETH",
       "decimals": 9,
-      "logoURI": "ipfs://QmcW8NHiqb6DnhWd5yo96K78qUuYvw7482x6WTzByJ2RKt"
+      "logoURI": "https://raw.githubusercontent.com/ichifarm/ichi/main/assets/oneETH.svg"
     },
     {
       "chainId": 1,
