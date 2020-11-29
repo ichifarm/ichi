@@ -41,6 +41,14 @@
       "decimals": 9,
       "logoURI": "https://raw.githubusercontent.com/ichifarm/ichi/main/assets/oneETH.svg"
     },
+    { 
+      "chainId": 1,
+      "address": "0x18Cc17a1EeD37C02A77B0B96b7890C7730E2a2CF",
+      "symbol": "oneLINK",
+      "name": "oneLINK",
+      "decimals": 9,
+      "logoURI": "https://raw.githubusercontent.com/ichifarm/ichi/main/assets/oneLINK.svg"
+    },
     {
       "chainId": 1,
       "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
