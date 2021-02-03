@@ -1,23 +1,23 @@
+// SPDX-License-Identifier: MIT License
 pragma solidity ^0.6.0;
 
 import "@chainlink/contracts/src/v0.6/interfaces/AggregatorV3Interface.sol";
-
 import "@openzeppelin/contracts/math/SafeMath.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-interface IUniswapOracle {
-    // We need the current prices of just about everything for the system to work!
-    // 
-    // Return the average time weighted price of oneETH (the Ethereum stable coin),
-    // the collateral (USDC, DAI, etc), and the cryptocurrencies (ETH, BTC, etc).
-    // This includes functions for changing the time interval for average,
-    // updating the oracle price, and returning the current price.
-    function changeInterval(uint256 seconds_) external;
+// interface for the oneToken
+interface OneToken {
+    function getOneTokenUsd() external view returns (uint256);
+}
+
+// interface for CollateralOracle
+interface IOracleInterface {
+    function getLatestPrice() external view returns (uint256);
     function update() external;
-    function consult(address token, uint amountIn) external view returns (uint amountOut);
+    function changeInterval(uint256 seconds_) external;
 }
 
 interface IWETH {
@@ -27,21 +27,12 @@ interface IWETH {
     function withdraw(uint) external;
 }
 
+/// @title An overcollateralized stablecoin using ETH
+/// @author Masanobu Fukuoka
 contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
-    // oneETH is the first fractionally backed stable coin that is especially designed for
-    // the Ethereum community.  In its fractional phase, ETH will be paid into the contract
-    // to mint new oneETH.  The Ethereum community will govern this ETH treasury, spending it
-    // on public goods, to re-collateralize oneETH, or on discount and perks for consumers to
-    // adopt oneETH or ETH.
-    //
-    // This contract is ownable and the owner has tremendous power.  This ownership will be
-    // transferred to a multi-sig contract controlled by signers elected by the community.
-    //
-    // Thanks for reading the contract and happy farming!
     using SafeMath for uint256;
 
-    // At 100% reserve ratio, each oneETH is backed 1-to-1 by $1 of existing stable coins
-    uint256 constant public MAX_RESERVE_RATIO = 100 * 10 ** 9;
+    uint256 public MAX_RESERVE_RATIO; // At 100% reserve ratio, each oneETH is backed 1-to-1 by $1 of existing stable coins
     uint256 private constant DECIMALS = 9;
     uint256 public lastRefreshReserve; // The last time the reserve ratio was updated by the contract
     uint256 public minimumRefreshTime; // The time between reserve ratio refreshes
@@ -49,23 +40,18 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
     address public stimulus; // oneETH builds a stimulus fund in ETH.
     uint256 public stimulusDecimals; // used to calculate oracle rate of Uniswap Pair
 
-    // We get the price of ETH from Chainlink!  Thanks chainLink!  Hopefully, the chainLink
-    // will provide Oracle prices for oneETH, oneBTC, etc in the future.  For now, we will get those
-    // from the ichi.farm exchange which uses Uniswap contracts.
-    AggregatorV3Interface internal chainlinkStimulusOracle;
-    AggregatorV3Interface internal ethPrice;
-
-
     address public oneTokenOracle; // oracle for the oneETH stable coin
-    address public stimulusOracle;  // oracle for a stimulus cryptocurrency that isn't on chainLink
-    bool public chainLink;         // true means it is a chainLink oracle
+    bool public oneTokenOracleHasUpdate; //if oneETH token oracle requires update
+    address public stimulusOracle;  // oracle for a stimulus 
+    bool public stimulusOracleHasUpdate; //if stimulus oracle requires update
 
     // Only governance should cause the coin to go fully agorithmic by changing the minimum reserve
     // ratio.  For now, we will set a conservative minimum reserve ratio.
     uint256 public MIN_RESERVE_RATIO;
+    uint256 public MIN_DELAY;
 
     // Makes sure that you can't send coins to a 0 address and prevents coins from being sent to the
-    // contract address. I want to protect your funds! 
+    // contract address. I want to protect your funds!
     modifier validRecipient(address to) {
         require(to != address(0x0));
         require(to != address(this));
@@ -74,13 +60,12 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
 
     uint256 private _totalSupply;
     mapping(address => uint256) private _oneBalances;
-    mapping(address => uint256) private _lastCall;
-    mapping (address => mapping (address => uint256)) private _allowedOne;
+    mapping(address => uint256) private _lastCall;  // used as a record to prevent flash loan attacks
+    mapping (address => mapping (address => uint256)) private _allowedOne; // allowance to spend one
 
-    address public wethAddress;
-    address public gov;
-    // allows you to transfer the governance to a different user - they must accept it!
-    address public pendingGov;
+    address public wethAddress; // used for uniswap oracle consults
+    address public gov; // who has admin rights over certain functions
+    address public pendingGov;  // allows you to transfer the governance to a different user - they must accept it!
     uint256 public reserveStepSize; // step size of update of reserve rate (e.g. 5 * 10 ** 8 = 0.5%)
     uint256 public reserveRatio;    // a number between 0 and 100 * 10 ** 9.
                                     // 0 = 0%
@@ -88,20 +73,21 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
 
     // map of acceptable collaterals
     mapping (address => bool) public acceptedCollateral;
-    address[] public collateralArray;
+    mapping (address => uint256) public collateralMintFee; // minting fee for different collaterals (100 * 10 ** 9 = 100% fee)
+    address[] public collateralArray; // array of collateral - used to iterate while updating certain things like oracle intervals for TWAP
 
     // modifier to allow auto update of TWAP oracle prices
     // also updates reserves rate programatically
     modifier updateProtocol() {
         if (address(oneTokenOracle) != address(0)) {
-            // only update if stimulusOracle is set
-            if (!chainLink) IUniswapOracle(stimulusOracle).update();
 
             // this is always updated because we always need stablecoin oracle price
-            IUniswapOracle(oneTokenOracle).update();
+            if (oneTokenOracleHasUpdate) IOracleInterface(oneTokenOracle).update();
 
-            for (uint i = 0; i < collateralArray.length; i++){ 
-                if (acceptedCollateral[collateralArray[i]]) IUniswapOracle(collateralOracle[collateralArray[i]]).update();
+            if (stimulusOracleHasUpdate) IOracleInterface(stimulusOracle).update();
+
+            for (uint i = 0; i < collateralArray.length; i++){
+                if (acceptedCollateral[collateralArray[i]] && !oneCoinCollateralOracle[collateralArray[i]]) IOracleInterface(collateralOracle[collateralArray[i]]).update();
             }
 
             // update reserve ratio if enough time has passed
@@ -116,31 +102,37 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
                 lastRefreshReserve = block.timestamp;
             }
         }
-        
+
         _;
     }
 
+    // events for off-chain record keeping
     event NewPendingGov(address oldPendingGov, address newPendingGov);
     event NewGov(address oldGov, address newGov);
     event NewReserveRate(uint256 reserveRatio);
     event Mint(address stimulus, address receiver, address collateral, uint256 collateralAmount, uint256 stimulusAmount, uint256 oneAmount);
     event Withdraw(address stimulus, address receiver, address collateral, uint256 collateralAmount, uint256 stimulusAmount, uint256 oneAmount);
     event NewMinimumRefreshTime(uint256 minimumRefreshTime);
+    event ExecuteTransaction(bytes32 indexed txHash, address indexed target, uint value, string signature,  bytes data);
 
     modifier onlyIchiGov() {
         require(msg.sender == gov, "ACCESS: only Ichi governance");
         _;
     }
 
-    bytes4 private constant SELECTOR = bytes4(keccak256(bytes('transfer(address,uint256)')));
-    mapping (address => uint256) public collateralDecimals;
-    mapping (address => bool) public previouslySeenCollateral;
+    bytes4 private constant SELECTOR = bytes4(keccak256(bytes('transfer(address,uint256)')));  // shortcut for calling transfer
+    mapping (address => uint256) public collateralDecimals;     // needed to be able to convert from different collaterals
+    mapping (address => bool) public oneCoinCollateralOracle;   // if true, we query the one token contract's usd price
+    mapping (address => bool) public previouslySeenCollateral;  // used to allow users to withdraw collateral, even if the collateral has since been deprecated
+                                                                // previouslySeenCollateral lets the contract know if a collateral has been used before - this also
+                                                                // prevents attacks where uses add a custom address as collateral, but that custom address is actually 
+                                                                // their own malicious smart contract. Read peckshield blog for more info.
     mapping (address => address) public collateralOracle;       // address of the Collateral-ETH Uniswap Price
+    mapping (address => bool) public collateralOracleHasUpdate; // if collatoral oracle requires an update
 
     // default to 0
     uint256 public mintFee;
     uint256 public withdrawFee;
-    uint256 public minBlockFreeze;
 
     // fee to charge when minting oneETH - this will go into collateral
     event MintFee(uint256 fee_);
@@ -158,9 +150,12 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
 
     event NewPendingLPGov(address oldPendingLPGov, address newPendingLPGov);
     event NewLPGov(address oldLPGov, address newLPGov);
+    event NewMintFee(address collateral, uint256 oldFee, uint256 newFee);
+
+    mapping (address => uint256) private _burnedStablecoin; // maps user to burned oneETH
 
     // important: make sure changeInterval is a function to allow the interval of update to change
-    function addCollateral(address collateral_, uint256 collateralDecimal_, address oracleAddress_)
+    function addCollateral(address collateral_, uint256 collateralDecimal_, address oracleAddress_, bool oneCoinOracle, bool oracleHasUpdate)
         external
         ethLPGov
     {
@@ -169,10 +164,25 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
 
         previouslySeenCollateral[collateral_] = true;
         acceptedCollateral[collateral_] = true;
+        oneCoinCollateralOracle[collateral_] = oneCoinOracle;
         collateralDecimals[collateral_] = collateralDecimal_;
         collateralOracle[collateral_] = oracleAddress_;
+        collateralMintFee[collateral_] = 0;
+        collateralOracleHasUpdate[collateral_]= oracleHasUpdate;
     }
 
+
+    function setCollateralMintFee(address collateral_, uint256 fee_)
+        external
+        ethLPGov
+    {
+        require(acceptedCollateral[collateral_], "invalid collateral");
+        require(fee_ <= 100 * 10 ** 9, "Fee must be valid");
+        emit NewMintFee(collateral_, collateralMintFee[collateral_], fee_);
+        collateralMintFee[collateral_] = fee_;
+    }
+
+    // step size = how much the reserve rate updates per update cycle
     function setReserveStepSize(uint256 stepSize_)
         external
         ethLPGov
@@ -180,14 +190,18 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         reserveStepSize = stepSize_;
     }
 
-    function setCollateralOracle(address collateral_, address oracleAddress_)
+    // changes the oracle for a given collaterarl
+    function setCollateralOracle(address collateral_, address oracleAddress_, bool oneCoinOracle_, bool oracleHasUpdate)
         external
         ethLPGov
     {
         require(acceptedCollateral[collateral_], "invalid collateral");
+        oneCoinCollateralOracle[collateral_] = oneCoinOracle_;
         collateralOracle[collateral_] = oracleAddress_;
+        collateralOracleHasUpdate[collateral_] = oracleHasUpdate;
     }
 
+    // removes a collateral from minting. Still allows withdrawals however
     function removeCollateral(address collateral_)
         external
         ethLPGov
@@ -195,19 +209,28 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         acceptedCollateral[collateral_] = false;
     }
 
+    // used for querying
+    function getBurnedStablecoin(address _user)
+        public
+        view
+        returns (uint256)
+    {
+        return _burnedStablecoin[_user];
+    }
+
     // returns 10 ** 9 price of collateral
     function getCollateralUsd(address collateral_) public view returns (uint256) {
-        // price is $Y / ETH (10 ** 8 decimals)
-        ( , int price, , uint timeStamp, ) = ethPrice.latestRoundData();
-        require(timeStamp > 0, "Rounds not complete");
+        require(previouslySeenCollateral[collateral_], "must be an existing collateral");
 
-        return uint256(price).mul(10 ** 10).div((IUniswapOracle(collateralOracle[collateral_]).consult(wethAddress, 10 ** 18)).mul(10 ** 9).div(10 ** collateralDecimals[collateral_]));
+        if (oneCoinCollateralOracle[collateral_]) return OneToken(collateral_).getOneTokenUsd();
+        
+        return IOracleInterface(collateralOracle[collateral_]).getLatestPrice();
     }
 
     function globalCollateralValue() public view returns (uint256) {
-        uint256 totalCollateralUsd = 0; 
+        uint256 totalCollateralUsd = 0;
 
-        for (uint i = 0; i < collateralArray.length; i++){ 
+        for (uint i = 0; i < collateralArray.length; i++){
             // Exclude null addresses
             if (collateralArray[i] != address(0)){
                 totalCollateralUsd += IERC20(collateralArray[i]).balanceOf(address(this)).mul(10 ** 9).div(10 ** collateralDecimals[collateralArray[i]]).mul(getCollateralUsd(collateralArray[i])).div(10 ** 9); // add stablecoin balance
@@ -223,11 +246,7 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         view
         returns (uint256)
     {
-        uint256 oneTokenPrice = IUniswapOracle(oneTokenOracle).consult(stimulus, 10 ** stimulusDecimals); // X one tokens (10 ** 9) / 1 stimulus token
-        uint256 stimulusTWAP = getStimulusOracle(); // $Y / 1 stimulus (10 ** 9)
-
-        uint256 oneTokenUsd = stimulusTWAP.mul(10 ** 9).div(oneTokenPrice); // 10 ** 9 decimals
-        return oneTokenUsd;
+        return IOracleInterface(oneTokenOracle).getLatestPrice();
     }
 
     /**
@@ -253,18 +272,6 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         returns (uint256)
     {
         return _oneBalances[who];
-    }
-
-    // oracle asset for collateral (oneETH is ETH, oneWHBAR is WHBAR, etc...)
-    function setChainLinkStimulusOracle(address oracle_)
-        external
-        ethLPGov
-        returns (bool)
-    {
-        chainlinkStimulusOracle = AggregatorV3Interface(oracle_);
-        chainLink = true;
-
-        return true;
     }
 
     /**
@@ -385,63 +392,37 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         return true;
     }
 
-    function setOneOracle(address oracle_)
+    function setOneTokenOracle(address oracle_, bool hasUpdate)
         external
         ethLPGov
-        returns (bool) 
+        returns (bool)
     {
         oneTokenOracle = oracle_;
-        
+        oneTokenOracleHasUpdate = hasUpdate;
+
         return true;
     }
 
-    function setStimulusUniswapOracle(address oracle_)
+    function setStimulusOracle(address oracle_, bool hasUpdate)
         external
         ethLPGov
         returns (bool)
     {
         stimulusOracle = oracle_;
-        chainLink = false;
+        stimulusOracleHasUpdate = hasUpdate;
 
         return true;
     }
 
     // oracle rate is 10 ** 9 decimals
     // returns $Z / Stimulus
-    function getStimulusOracle()
+    function getStimulusUSD()
         public
         view
         returns (uint256)
     {
-        if (chainLink) {
-            (
-                uint80 roundID, 
-                int price,
-                uint startedAt,
-                uint timeStamp,
-                uint80 answeredInRound
-            ) = chainlinkStimulusOracle.latestRoundData();
-
-            require(timeStamp > 0, "Rounds not complete");
-
-            return uint256(price).mul(10); // 10 ** 9 price
-        } else {
-            // stimulusTWAP has `stimulusDecimals` decimals
-            uint256 stimulusTWAP = IUniswapOracle(stimulusOracle).consult(wethAddress, 1 * 10 ** 18); // 1 ETH = X Stimulus, or X Stimulus / ETH
-
-            // price is $Y / ETH
-            (
-                uint80 roundID, 
-                int price,
-                uint startedAt,
-                uint timeStamp,
-                uint80 answeredInRound
-            ) = ethPrice.latestRoundData();
-
-            require(timeStamp > 0, "Rounds not complete");
-
-            return uint256(price).mul(10 ** stimulusDecimals).div(stimulusTWAP); // 10 ** 9 price
-        }
+        return IOracleInterface(stimulusOracle).getLatestPrice();
+       
     }
 
     // minimum amount of block time (seconds) required for an update in reserve ratio
@@ -455,13 +436,13 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         minimumRefreshTime = val_;
 
         // change collateral array
-        for (uint i = 0; i < collateralArray.length; i++){ 
-            if (acceptedCollateral[collateralArray[i]]) IUniswapOracle(collateralOracle[collateralArray[i]]).changeInterval(val_);
+        for (uint i = 0; i < collateralArray.length; i++){
+            if (acceptedCollateral[collateralArray[i]] && !oneCoinCollateralOracle[collateralArray[i]] && collateralOracleHasUpdate[collateralArray[i]]) IOracleInterface(collateralOracle[collateralArray[i]]).changeInterval(val_);
         }
 
-        // stimulus and oneToken oracle update
-        IUniswapOracle(oneTokenOracle).changeInterval(val_);
-        if (!chainLink) IUniswapOracle(stimulusOracle).changeInterval(val_);
+        if (oneTokenOracleHasUpdate) IOracleInterface(oneTokenOracle).changeInterval(val_);
+
+        if (stimulusOracleHasUpdate) IOracleInterface(stimulusOracle).changeInterval(val_);
 
         // change all the oracles (collateral, stimulus, oneToken)
 
@@ -469,34 +450,23 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         return true;
     }
 
-    // tokenSymbol: oneETH etc...
-    // stimulus_: address of the stimulus (ETH, wBTC, wHBAR)...
-    // stimulusDecimals_: decimals of stimulus (e.g. 18)
-    // wethAddress_: address of WETH
-    // ethOracleChainLink_: address of chainlink oracle for ETH / USD
-
-    // don't forget to set oracle for stimulus later (ETH, wBTC etc probably can use Chainlink, others use Uniswap)
-    // chain link stimulus:     setChainLinkStimulusOracle(address)
-    // uniswap stimulus:        setStimulusUniswapOracle(address)  
     constructor(
         uint256 reserveRatio_,
         address stimulus_,
         uint256 stimulusDecimals_,
-        address wethAddress_,
-        address ethOracleChainLink_,
-        uint256 minBlockFreeze_
+        address wethAddress_
     )
         public
-    {   
+    {
         _setupDecimals(uint8(9));
         stimulus = stimulus_;
         minimumRefreshTime = 3600 * 1; // 1 hour by default
         stimulusDecimals = stimulusDecimals_;
-        minBlockFreeze = block.number.add(minBlockFreeze_);
-        reserveStepSize = 1 * 10 ** 8;  // 0.1% by default
-        ethPrice = AggregatorV3Interface(ethOracleChainLink_);
+        reserveStepSize = 2 * 10 ** 8;  // 0.2% by default
         MIN_RESERVE_RATIO = 90 * 10 ** 9;
+        MAX_RESERVE_RATIO = 100 * 10 ** 9;
         wethAddress = wethAddress_;
+        MIN_DELAY = 3;             // 3 blocks
         withdrawFee = 1 * 10 ** 8; // 0.1% fee at first, remains in collateral
         gov = msg.sender;
         lpGov = msg.sender;
@@ -506,12 +476,28 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         _oneBalances[msg.sender] = 10 ** 9;
         emit Transfer(address(0x0), msg.sender, 10 ** 9);
     }
-    
+
     function setMinimumReserveRatio(uint256 val_)
         external
         ethLPGov
     {
         MIN_RESERVE_RATIO = val_;
+        if (MIN_RESERVE_RATIO > reserveRatio) setReserveRatio(MIN_RESERVE_RATIO);
+    }
+
+    function setMaximumReserveRatio(uint256 val_)
+        external
+        ethLPGov
+    {
+        MAX_RESERVE_RATIO = val_;
+        if (MAX_RESERVE_RATIO < reserveRatio) setReserveRatio(MAX_RESERVE_RATIO);
+    }
+
+    function setMinimumDelay(uint256 val_)
+        external
+        ethLPGov
+    {
+        MIN_DELAY = val_;
     }
 
     // LP pool governance ====================================
@@ -569,16 +555,15 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
 
         // convert to correct decimals for collateral
         uint256 collateralAmount = oneAmount.mul(reserveRatio).div(MAX_RESERVE_RATIO).mul(10 ** collateralDecimals[collateral]).div(10 ** DECIMALS);
-        collateralAmount = collateralAmount.mul(10 ** collateralDecimals[collateral]).div(getCollateralUsd(collateral));
+        collateralAmount = collateralAmount.mul(10 ** 9).div(getCollateralUsd(collateral));
 
         if (address(oneTokenOracle) == address(0)) return (collateralAmount, 0);
 
-        uint256 oneTokenUsd = getOneTokenUsd();             // 10 ** 9
-        uint256 oneCollateralUsd = getStimulusOracle();     // 10 ** 9
+        uint256 stimulusUsd = getStimulusUSD();     // 10 ** 9
 
         uint256 stimulusAmountInOneStablecoin = oneAmount.mul(MAX_RESERVE_RATIO.sub(reserveRatio)).div(MAX_RESERVE_RATIO);
 
-        uint256 stimulusAmount = stimulusAmountInOneStablecoin.mul(oneTokenUsd).div(oneCollateralUsd).mul(10 ** stimulusDecimals).div(10 ** DECIMALS); // must be 10 ** stimulusDecimals
+        uint256 stimulusAmount = stimulusAmountInOneStablecoin.mul(10 ** 9).div(stimulusUsd).mul(10 ** stimulusDecimals).div(10 ** DECIMALS); // must be 10 ** stimulusDecimals
 
         return (collateralAmount, stimulusAmount);
     }
@@ -589,7 +574,7 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         returns (uint256, uint256)
     {
         require(oneAmount != 0, "must use valid oneAmount");
-        require(acceptedCollateral[collateral], "must be an accepted collateral");
+        require(previouslySeenCollateral[collateral], "must be an accepted collateral");
 
         uint256 collateralAmount = oneAmount.sub(oneAmount.mul(withdrawFee).div(100 * 10 ** DECIMALS)).mul(10 ** collateralDecimals[collateral]).div(10 ** DECIMALS);
         collateralAmount = collateralAmount.mul(10 ** 9).div(getCollateralUsd(collateral));
@@ -605,27 +590,27 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
     )
         public
         payable
-        validRecipient(msg.sender)
         nonReentrant
-        updateProtocol()
     {
         require(acceptedCollateral[collateral], "must be an accepted collateral");
+        require(oneAmount != 0, "must mint non-zero amount");
 
         // wait 3 blocks to avoid flash loans
-        require((_lastCall[msg.sender] + 30) <= block.timestamp, "action too soon - please wait a few more blocks");
+        require((_lastCall[msg.sender] + MIN_DELAY) <= block.number, "action too soon - please wait a few more blocks");
 
         // validate input amounts are correct
         (uint256 collateralAmount, uint256 stimulusAmount) = consultOneDeposit(oneAmount, collateral);
         require(collateralAmount <= IERC20(collateral).balanceOf(msg.sender), "sender has insufficient collateral balance");
-
+        
         // auto convert ETH to WETH if needed
         bool convertedWeth = false;
         if (stimulus == wethAddress && IERC20(stimulus).balanceOf(msg.sender) < stimulusAmount) {
             // enough ETH
-            if (address(msg.sender).balance >= stimulusAmount) {
-                IWETH(wethAddress).deposit{value: stimulusAmount}();
-                assert(IWETH(wethAddress).transfer(address(this), stimulusAmount));
-                if (msg.value > stimulusAmount) safeTransferETH(msg.sender, msg.value - stimulusAmount);
+            if (address(msg.sender).balance >= msg.value && msg.value >= stimulusAmount) {
+                uint256 currentwETHBalance = IERC20(stimulus).balanceOf(address(this));
+                IWETH(wethAddress).deposit{value: msg.value}();
+                require(IERC20(stimulus).balanceOf(address(this)) == currentwETHBalance.add(msg.value),"insufficient stimulus deposited");
+                assert(IWETH(wethAddress).transfer(msg.sender, msg.value.sub(stimulusAmount)));
                 convertedWeth = true;
             } else {
                 require(stimulusAmount <= IERC20(stimulus).balanceOf(msg.sender), "sender has insufficient stimulus balance");
@@ -634,18 +619,23 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
 
         // checks passed, so transfer tokens
         SafeERC20.safeTransferFrom(IERC20(collateral), msg.sender, address(this), collateralAmount);
+        if (!convertedWeth) {
+            SafeERC20.safeTransferFrom(IERC20(stimulus), msg.sender, address(this), stimulusAmount);
 
-        if (!convertedWeth) SafeERC20.safeTransferFrom(IERC20(stimulus), msg.sender, address(this), stimulusAmount);
+            (bool success,) = address(msg.sender).call{value:msg.value}(new bytes(0));
+            require(success, 'ETH_TRANSFER_FAILED');
+        }
 
-        // apply mint fee
-        oneAmount = oneAmount.sub(oneAmount.mul(mintFee).div(100 * 10 ** DECIMALS));
+        oneAmount = oneAmount.sub(oneAmount.mul(mintFee).div(100 * 10 ** DECIMALS));                            // apply mint fee
+        oneAmount = oneAmount.sub(oneAmount.mul(collateralMintFee[collateral]).div(100 * 10 ** DECIMALS));      // apply collateral fee
 
         _totalSupply = _totalSupply.add(oneAmount);
         _oneBalances[msg.sender] = _oneBalances[msg.sender].add(oneAmount);
 
-        _lastCall[msg.sender] = block.timestamp;
-
         emit Transfer(address(0x0), msg.sender, oneAmount);
+
+        _lastCall[msg.sender] = block.number;
+
         emit Mint(stimulus, msg.sender, collateral, collateralAmount, stimulusAmount, oneAmount);
     }
 
@@ -654,6 +644,7 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         external
         onlyIchiGov
     {
+        require(fee_ <= 100 * 10 ** 9, "Fee must be valid");
         mintFee = fee_;
         emit MintFee(fee_);
     }
@@ -667,26 +658,55 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         emit WithdrawFee(fee_);
     }
 
-    // @title: burn oneETH and receive collateral + stimulus token
-    // oneAmount: amount of oneToken to burn to withdraw
+    /// burns stablecoin and increments _burnedStablecoin mapping for user
+    ///         user can claim collateral in a 2nd step below
     function withdraw(
         uint256 oneAmount,
         address collateral
     )
         public
-        validRecipient(msg.sender)
         nonReentrant
         updateProtocol()
     {
+        require(oneAmount != 0, "must withdraw non-zero amount");
         require(oneAmount <= _oneBalances[msg.sender], "insufficient balance");
-        require((_lastCall[msg.sender] + 30) <= block.timestamp, "action too soon - please wait 3 blocks");
+        require(previouslySeenCollateral[collateral], "must be an existing collateral");
+        require((_lastCall[msg.sender] + MIN_DELAY) <= block.number, "action too soon - please wait a few blocks");
 
         // burn oneAmount
         _totalSupply = _totalSupply.sub(oneAmount);
         _oneBalances[msg.sender] = _oneBalances[msg.sender].sub(oneAmount);
 
+        _burnedStablecoin[msg.sender] = _burnedStablecoin[msg.sender].add(oneAmount);
+
+        _lastCall[msg.sender] = block.number;
+        emit Transfer(msg.sender, address(0x0), oneAmount);
+    }
+
+    // 2nd step for withdrawal of collateral
+    // this 2 step withdrawal is important for prevent flash-loan style attacks
+    // flash-loan style attacks try to use loops/complex arbitrage strategies to
+    // drain collateral so adding a 2-step process prevents any potential attacks
+    // because all flash-loans must be repaid within 1 tx and 1 block
+
+    /// @notice If you are interested, I would recommend reading: https://slowmist.medium.com/
+    ///         also https://cryptobriefing.com/50-million-lost-the-top-19-defi-cryptocurrency-hacks-2020/
+    function withdrawFinal(address collateral, uint256 amount)
+        public
+        nonReentrant
+        updateProtocol()
+    {
+        require(previouslySeenCollateral[collateral], "must be an existing collateral");
+        require((_lastCall[msg.sender] + MIN_DELAY) <= block.number, "action too soon - please wait a few blocks");
+
+        uint256 oneAmount = _burnedStablecoin[msg.sender];
+        require(oneAmount != 0, "insufficient oneETH to redeem");
+        require(amount <= oneAmount, "insufficient oneETH to redeem");
+
+        _burnedStablecoin[msg.sender] = _burnedStablecoin[msg.sender].sub(amount);
+
         // send collateral - fee (convert to collateral decimals too)
-        uint256 collateralAmount = oneAmount.sub(oneAmount.mul(withdrawFee).div(100 * 10 ** DECIMALS)).mul(10 ** collateralDecimals[collateral]).div(10 ** DECIMALS);
+        uint256 collateralAmount = amount.sub(amount.mul(withdrawFee).div(100 * 10 ** DECIMALS)).mul(10 ** collateralDecimals[collateral]).div(10 ** DECIMALS);
         collateralAmount = collateralAmount.mul(10 ** 9).div(getCollateralUsd(collateral));
 
         uint256 stimulusAmount = 0;
@@ -696,16 +716,14 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
 
         SafeERC20.safeTransfer(IERC20(collateral), msg.sender, collateralAmount);
 
-        _lastCall[msg.sender] = block.timestamp;
+        _lastCall[msg.sender] = block.number;
 
-        emit Transfer(msg.sender, address(0x0), oneAmount);
-        emit Withdraw(stimulus, msg.sender, collateral, collateralAmount, stimulusAmount, oneAmount);
+        emit Withdraw(stimulus, msg.sender, collateral, collateralAmount, stimulusAmount, amount);
     }
 
-    // change reserveRatio
-    // market driven -> decide the ratio automatically
-    // if one coin >= $1, we lower reserve rate by half a percent
-    // if one coin < $1, we increase reserve rate
+    // internal function used to set the reserve ratio of the token
+    // must be between MIN / MAX Reserve Ratio, which are constants
+    // cannot be 0
     function setReserveRatio(uint256 newRatio_)
         internal
     {
@@ -717,12 +735,18 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         }
     }
 
-    function safeTransferETH(address to, uint value) internal {
+    /// @notice easy function transfer ETH (not WETH)
+    function safeTransferETH(address to, uint value)
+        public
+        ethLPGov
+    {
         (bool success,) = to.call{value:value}(new bytes(0));
         require(success, 'ETH_TRANSFER_FAILED');
     }
 
-    /// @notice Move stimulus - multisig only
+    /// @notice easy funtion to move stimulus to a new location
+    //  location: address to send to
+    //  amount: amount of stimulus to send (use full decimals)
     function moveStimulus(
         address location,
         uint256 amount
@@ -730,8 +754,29 @@ contract oneETH is ERC20("oneETH", "oneETH"), Ownable, ReentrancyGuard {
         public
         ethLPGov
     {
-        require(block.number > minBlockFreeze, "minBlockFreeze time limit not met yet - try again later");
         SafeERC20.safeTransfer(IERC20(stimulus), location, amount);
+    }
+
+    // can execute any abstract transaction on this smart contrat
+    // target: address / smart contract you are interracting with
+    // value: msg.value (amount of eth in WEI you are sending. Most of the time it is 0)
+    // signature: the function signature (name of the function and the types of the arguments).
+    //            for example: "transfer(address,uint256)", or "approve(address,uint256)"
+    // data: abi-encodeded byte-code of the parameter values you are sending. See "./encode.js" for Ether.js library function to make this easier
+    function executeTransaction(address target, uint value, string memory signature, bytes memory data) public payable ethLPGov returns (bytes memory) {
+        bytes memory callData;
+
+        if (bytes(signature).length == 0) {
+            callData = data;
+        } else {
+            callData = abi.encodePacked(bytes4(keccak256(bytes(signature))), data);
+        }
+
+        // solium-disable-next-line security/no-call-value
+        (bool success, bytes memory returnData) = target.call.value(value)(callData);
+        require(success, "oneETH::executeTransaction: Transaction execution reverted.");
+
+        return returnData;
     }
 
 }
